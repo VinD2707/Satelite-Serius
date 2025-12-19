@@ -1,227 +1,323 @@
-# app.py (ROOT-BASED: file artefak ada di folder root repo)
-
+import os
 import io
+import pickle
 import numpy as np
-import joblib
 import streamlit as st
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 
-# -------------------------
-# Paths (semua di ROOT repo)
-# -------------------------
-CKPT_PATH = "./unet13_best.pth"
-META_PATH = "./unet13_meta.npz"
-LR_PATH   = "./lr_risk.pkl"
+# =========================
+# Config / filenames (root)
+# =========================
+CKPT_PATH = "unet13_best.pth"
+META_PATH = "unet13_meta.npz"
+LR_PATH   = "lr_risk.pkl"
 
-# ============================================================
-# 1) PASTE KELAS U-NET KAMU DI SINI (HARUS SAMA PERSIS)
-# ============================================================
-# Contoh placeholder (JANGAN dipakai kalau beda dengan training-mu)
-# -> Ganti ini dengan class U-Net yang kamu pakai saat training.
-class UNetYOUR(nn.Module):
-    def __init__(self, in_ch=13, out_ch=1):
+# Default thresholds (dari hasil kamu sebelumnya)
+DEFAULT_T_PIXEL_HIGH = 0.55
+DEFAULT_T_LOW  = 0.35083405887107555
+DEFAULT_T_HIGH = 0.6820491097886825
+
+# =========================
+# Model definition (MUST MATCH TRAINING)
+# =========================
+class DoubleConv(nn.Module):
+    def __init__(self, in_ch, out_ch):
         super().__init__()
-        # TODO: paste arsitektur U-Net aslimu di sini
-        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=1)
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
 
     def forward(self, x):
-        return self.conv(x)
+        return self.net(x)
 
-# -------------------------
-# Helper: pilih key npz secara aman
-# -------------------------
-def pick_key(d, candidates):
+class UNetSmall(nn.Module):
+    def __init__(self, in_channels=13, out_channels=1, base=32):
+        super().__init__()
+        self.enc1 = DoubleConv(in_channels, base)
+        self.pool1 = nn.MaxPool2d(2)
+        self.enc2 = DoubleConv(base, base * 2)
+        self.pool2 = nn.MaxPool2d(2)
+        self.enc3 = DoubleConv(base * 2, base * 4)
+        self.pool3 = nn.MaxPool2d(2)
+
+        self.bottleneck = DoubleConv(base * 4, base * 8)
+
+        self.up3 = nn.ConvTranspose2d(base * 8, base * 4, 2, stride=2)
+        self.dec3 = DoubleConv(base * 8, base * 4)
+        self.up2 = nn.ConvTranspose2d(base * 4, base * 2, 2, stride=2)
+        self.dec2 = DoubleConv(base * 4, base * 2)
+        self.up1 = nn.ConvTranspose2d(base * 2, base, 2, stride=2)
+        self.dec1 = DoubleConv(base * 2, base)
+
+        self.out = nn.Conv2d(base, out_channels, 1)
+
+    def forward(self, x):
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool1(e1))
+        e3 = self.enc3(self.pool2(e2))
+
+        b = self.bottleneck(self.pool3(e3))
+
+        d3 = self.up3(b)
+        d3 = torch.cat([d3, e3], dim=1)
+        d3 = self.dec3(d3)
+
+        d2 = self.up2(d3)
+        d2 = torch.cat([d2, e2], dim=1)
+        d2 = self.dec2(d2)
+
+        d1 = self.up1(d2)
+        d1 = torch.cat([d1, e1], dim=1)
+        d1 = self.dec1(d1)
+
+        return self.out(d1)
+
+# =========================
+# Helpers
+# =========================
+def safe_torch_load(path, map_location="cpu"):
+    """
+    PyTorch 2.6+ default weights_only=True bisa bikin error untuk objek numpy.
+    Kita paksa load full dict (trusted file milik sendiri).
+    """
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        # older torch doesn't support weights_only
+        return torch.load(path, map_location=map_location)
+
+def to_hwc(x):
+    # (12,H,W) -> (H,W,12)
+    if x.ndim == 3 and x.shape[0] in [12, 13] and x.shape[1] > 64 and x.shape[2] > 64:
+        return np.transpose(x, (1,2,0))
+    return x
+
+def pick_key(npz, candidates):
     for k in candidates:
-        if k in d:
+        if k in npz.files:
             return k
+    # fallback: cari yang paling mirip
+    for k in npz.files:
+        low = k.lower()
+        for c in candidates:
+            if c.lower() in low:
+                return k
     return None
 
-def load_npz_from_upload(uploaded_file):
-    """Load npz dari upload Streamlit. Output: x12(H,W,12), aerosol(H,W) or None, keys(list)."""
-    data = np.load(io.BytesIO(uploaded_file.read()))
-    keys = list(data.keys())
+def build_13ch_tensor(x12_hwc, aerosol_hw, mean13, std13):
+    # x12_hwc: (H,W,12)
+    # aerosol_hw: (H,W)
+    if aerosol_hw is None:
+        aerosol_hw = np.zeros((x12_hwc.shape[0], x12_hwc.shape[1]), dtype=np.float32)
 
-    x_key = pick_key(data, ["image", "x", "s2", "img", "bands"])
-    a_key = pick_key(data, ["aerosol", "aot", "aero", "a"])
+    x13 = np.concatenate([x12_hwc, aerosol_hw[..., None]], axis=-1)  # (H,W,13)
+    x13 = x13.astype(np.float32)
 
-    if x_key is None:
-        raise ValueError(f"Tidak menemukan key citra 12-band. Keys tersedia: {keys}")
+    mean13 = np.array(mean13, dtype=np.float32).reshape(1,1,13)
+    std13  = np.array(std13, dtype=np.float32).reshape(1,1,13)
+    x13n = (x13 - mean13) / (std13 + 1e-8)
 
-    x = data[x_key]  # (12,H,W) atau (H,W,12)
-    if x.ndim != 3:
-        raise ValueError(f"Citra harus 3D (12,H,W) atau (H,W,12). Dapat: {x.shape}")
+    # to torch (1,13,H,W)
+    x13n = np.transpose(x13n, (2,0,1))
+    X = torch.from_numpy(x13n).unsqueeze(0)
+    return X
 
-    # ubah ke HWC
-    if x.shape[0] == 12:
-        x = np.transpose(x, (1,2,0))
-    if x.shape[-1] != 12:
-        raise ValueError(f"Jumlah channel harus 12. Dapat: {x.shape}")
+def sigmoid_np(x):
+    return 1.0 / (1.0 + np.exp(-x))
 
-    x = x.astype(np.float32)
+def rgb_composite_from_12(x12_hwc, b4=3, b3=2, b2=1):
+    # gunakan indeks band_map kamu: B2=1, B3=2, B4=3
+    R = x12_hwc[..., b4].astype(np.float32)
+    G = x12_hwc[..., b3].astype(np.float32)
+    B = x12_hwc[..., b2].astype(np.float32)
 
-    # aerosol optional
-    a = None
-    if a_key is not None:
-        a = data[a_key]
-        if np.isscalar(a):
-            a = np.full((x.shape[0], x.shape[1]), float(a), dtype=np.float32)
-        else:
-            a = np.array(a)
-            if a.ndim == 3 and a.shape[0] == 1:
-                a = a[0]
-            if a.ndim != 2:
-                # fallback reshape kalau size cocok
-                if a.size == x.shape[0]*x.shape[1]:
-                    a = a.reshape(x.shape[0], x.shape[1]).astype(np.float32)
-                else:
-                    raise ValueError(f"Aerosol harus 2D (H,W) atau scalar. Dapat: {a.shape}")
-        a = a.astype(np.float32)
+    rgb = np.stack([R,G,B], axis=-1)
 
-    return x, a, keys
-
-def to_rgb_composite(x12_hwc, idx_r, idx_g, idx_b):
-    """Simple RGB composite + percentile stretch."""
-    rgb = np.stack([x12_hwc[..., idx_r], x12_hwc[..., idx_g], x12_hwc[..., idx_b]], axis=-1)
-    p2, p98 = np.percentile(rgb, (2, 98))
-    rgb = (rgb - p2) / (p98 - p2 + 1e-6)
+    # simple robust normalization (percentile stretch)
+    lo = np.percentile(rgb, 2)
+    hi = np.percentile(rgb, 98)
+    rgb = (rgb - lo) / (hi - lo + 1e-8)
     rgb = np.clip(rgb, 0, 1)
     return rgb
 
-def build_13ch_tensor(x12_hwc, aerosol_hw, mean13, std13):
-    H, W, _ = x12_hwc.shape
-    if aerosol_hw is None:
-        aerosol_hw = np.zeros((H, W), dtype=np.float32)
-
-    x13 = np.concatenate([x12_hwc, aerosol_hw[..., None]], axis=-1)  # H,W,13
-    x13 = (x13 - mean13) / (std13 + 1e-6)                           # broadcast
-    x13_chw = np.transpose(x13, (2,0,1))                            # 13,H,W
-    return torch.from_numpy(x13_chw).float()
-
-@torch.no_grad()
-def predict_prob_map(model, x12_hwc, aerosol_hw, mean13, std13, device):
-    X = build_13ch_tensor(x12_hwc, aerosol_hw, mean13, std13).unsqueeze(0).to(device)  # 1,13,H,W
-    logits = model(X)                      # 1,1,H,W
-    prob = torch.sigmoid(logits)[0,0].detach().cpu().numpy()
-    return prob
-
-def compute_risk_features(prob_map, t_pixel_high=0.55):
-    mask_high = (prob_map >= t_pixel_high).astype(np.uint8)
-    area_high = float(mask_high.mean())  # fraction 0..1
-    conf_high = float(prob_map[mask_high==1].mean()) if mask_high.sum() > 0 else 0.0
-    return mask_high, area_high, conf_high
-
-def classify_risk_from_fri(fri, t_low, t_high):
+def classify_risk(fri, t_low, t_high):
     if fri < t_low:
         return "LOW"
-    elif fri < t_high:
+    elif fri <= t_high:
         return "MEDIUM"
     else:
         return "HIGH"
 
-# -------------------------
-# Cache load artifacts
-# -------------------------
+# =========================
+# Load artifacts (cached)
+# =========================
 @st.cache_resource
 def load_artifacts():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device
+    device = torch.device("cpu")
 
-    # meta
-    meta = np.load(META_PATH)
-    if "mean_13" not in meta or "std_13" not in meta:
-        raise ValueError(f"unet13_meta.npz harus punya key mean_13 & std_13. Keys: {list(meta.keys())}")
+    # load ckpt dict
+    if not os.path.exists(CKPT_PATH):
+        raise FileNotFoundError(f"Checkpoint not found: {CKPT_PATH}")
 
-    mean13 = meta["mean_13"].astype(np.float32).reshape(1,1,-1)
-    std13  = meta["std_13"].astype(np.float32).reshape(1,1,-1)
+    ckpt = safe_torch_load(CKPT_PATH, map_location=device)
 
-    # lr model
-    lr = joblib.load(LR_PATH)
-
-    # load model
-    model = UNetYOUR(in_ch=13, out_ch=1).to(device)
-
-    ckpt = torch.load(CKPT_PATH, map_location=device, weights_only=False)
-
-    # kamu simpan key "model_state"
+    # model
+    model = UNetSmall(in_channels=13, out_channels=1, base=32).to(device)
     if "model_state" not in ckpt:
-        raise ValueError(f"Checkpoint tidak punya key 'model_state'. Keys: {list(ckpt.keys())}")
-
-    model.load_state_dict(ckpt["model_state"])
+        raise KeyError("Key 'model_state' not found in checkpoint. Pastikan file unet13_best.pth adalah hasil torch.save({...}).")
+    model.load_state_dict(ckpt["model_state"], strict=True)
     model.eval()
 
-    # defaults
-    # threshold pixel high biasanya kamu pilih dari sweep dice (contoh 0.55)
-    t_pixel_high_default = 0.55
+    # mean/std from ckpt (utama), fallback to meta npz
+    mean13 = ckpt.get("mean_13", None)
+    std13  = ckpt.get("std_13", None)
+    thr    = float(ckpt.get("thr", DEFAULT_T_PIXEL_HIGH))
 
-    return device, model, lr, mean13, std13, t_pixel_high_default
+    if (mean13 is None or std13 is None) and os.path.exists(META_PATH):
+        with np.load(META_PATH, allow_pickle=True) as m:
+            # kalau meta kamu beda key, aman: kita coba cari
+            k_mean = pick_key(m, ["mean_13", "MEAN_13", "mean13"])
+            k_std  = pick_key(m, ["std_13", "STD_13", "std13"])
+            k_thr  = pick_key(m, ["thr", "THR", "t_pixel_high"])
+            if mean13 is None and k_mean: mean13 = m[k_mean]
+            if std13  is None and k_std:  std13  = m[k_std]
+            if k_thr: thr = float(m[k_thr])
 
-# ============================================================
-# Streamlit UI
-# ============================================================
-st.set_page_config(page_title="Fire Risk Mapping", layout="wide")
+    if mean13 is None or std13 is None:
+        raise ValueError("mean_13/std_13 tidak ditemukan. Pastikan ckpt menyimpan mean_13 dan std_13 atau file unet13_meta.npz berisi mean/std.")
+
+    # load lr risk model
+    if not os.path.exists(LR_PATH):
+        raise FileNotFoundError(f"Risk model not found: {LR_PATH}")
+    with open(LR_PATH, "rb") as f:
+        lr_model = pickle.load(f)
+
+    return device, model, lr_model, mean13, std13, thr
+
+# =========================
+# UI
+# =========================
+st.set_page_config(page_title="Fire Risk Mapping (Sentinel-2 + FRI)", layout="wide")
 st.title("Fire Risk Mapping berbasis Segmentasi Sentinel-2 + Fire Risk Index (FRI)")
 
-device, model, lr, mean13, std13, t_pix_default = load_artifacts()
+with st.sidebar:
+    st.header("Threshold Settings")
+    t_pixel_high = st.slider("Pixel High-risk Threshold (t_pixel_high)", 0.05, 0.95, float(DEFAULT_T_PIXEL_HIGH), 0.01)
+    t_low  = st.slider("FRI Threshold LOW (t_low)", 0.0, 1.0, float(DEFAULT_T_LOW), 0.01)
+    t_high = st.slider("FRI Threshold HIGH (t_high)", 0.0, 1.0, float(DEFAULT_T_HIGH), 0.01)
+    st.caption("Catatan: t_pixel_high adalah threshold di peta probabilitas (pixel-wise). t_low/t_high untuk klasifikasi FRI (patch-wise).")
 
-st.sidebar.header("Pengaturan Threshold")
+uploaded = st.file_uploader("Upload 1 file patch .npz (Sen2Fire)", type=["npz"])
 
-t_pixel_high = st.sidebar.slider("Pixel high-risk threshold (t_pixel_high)", 0.10, 0.95, float(t_pix_default), 0.01)
+# Load artifacts once
+device, model, lr_model, mean13, std13, thr_ckpt = load_artifacts()
 
-# pakai hasil val-mu (dari distribusi FRI)
-t_low  = st.sidebar.number_input("FRI threshold LOW/MEDIUM (t_low)", value=0.350834, format="%.6f")
-t_high = st.sidebar.number_input("FRI threshold MEDIUM/HIGH (t_high)", value=0.682049, format="%.6f")
-
-uploaded = st.file_uploader("Upload 1 patch .npz (12-band + aerosol optional)", type=["npz"])
+st.info(f"Artifacts loaded: model=UNetSmall(13ch), checkpoint='{CKPT_PATH}', lr='{LR_PATH}'")
 
 if uploaded is None:
-    st.info("Upload file .npz untuk menghasilkan peta probabilitas dan level risiko.")
     st.stop()
 
+# =========================
+# Read NPZ safely
+# =========================
+npz_bytes = uploaded.read()
+npz_file = np.load(io.BytesIO(npz_bytes), allow_pickle=True)
+
+k_img = pick_key(npz_file, ["image", "img", "x", "X"])
+k_aer = pick_key(npz_file, ["aerosol", "aero", "aerosol_product", "A"])
+
+if k_img is None:
+    st.error(f"Tidak menemukan key image di npz. Keys tersedia: {npz_file.files}")
+    st.stop()
+
+x = npz_file[k_img]
+x = to_hwc(x)
+
+# Pastikan 12 band
+if x.ndim != 3 or x.shape[-1] < 12:
+    st.error(f"Shape image tidak sesuai. Dapat: {x.shape}. Harusnya (H,W,12) atau (12,H,W).")
+    st.stop()
+
+x12 = x[..., :12].astype(np.float32)
+
+aer = None
+if k_aer is not None:
+    aer_raw = npz_file[k_aer]
+    if aer_raw.ndim == 3 and aer_raw.shape[0] == 1:
+        aer_raw = aer_raw[0]
+    if aer_raw.ndim == 3 and aer_raw.shape[-1] == 1:
+        aer_raw = aer_raw[..., 0]
+    if aer_raw.ndim == 2:
+        aer = aer_raw.astype(np.float32)
+
+# =========================
+# Predict prob_map
+# =========================
+X = build_13ch_tensor(x12, aer, mean13, std13).to(device)
+
+with torch.no_grad():
+    logits = model(X)                 # (1,1,H,W)
+    probs = torch.sigmoid(logits)[0,0].cpu().numpy().astype(np.float32)
+
+prob_map = probs
+mask_high = (prob_map >= float(t_pixel_high))
+area_high = float(mask_high.mean())  # fraction of pixels
+conf_high = float(prob_map[mask_high].mean()) if mask_high.any() else 0.0
+
+# =========================
+# FRI from Logistic Regression
+# Features: [area_high, conf_high]
+# =========================
+feat = np.array([[area_high, conf_high]], dtype=np.float32)
 try:
-    x12, aerosol, keys = load_npz_from_upload(uploaded)
+    fri = float(lr_model.predict_proba(feat)[0,1])
+except Exception:
+    # fallback if model doesn't support predict_proba
+    score = float(lr_model.decision_function(feat)[0])
+    fri = float(sigmoid_np(score))
 
-    prob_map = predict_prob_map(model, x12, aerosol, mean13, std13, device)
-    mask_high, area_high, conf_high = compute_risk_features(prob_map, t_pixel_high=t_pixel_high)
+risk_level = classify_risk(fri, float(t_low), float(t_high))
 
-    # FRI via Logistic Regression: fitur [area_high, conf_high]
-    fri = float(lr.predict_proba([[area_high, conf_high]])[0,1])
-    level = classify_risk_from_fri(fri, t_low=t_low, t_high=t_high)
+# =========================
+# Visualize
+# =========================
+rgb = rgb_composite_from_12(x12, b4=3, b3=2, b2=1)
 
-    band_map = {"B2":1, "B3":2, "B4":3, "B8":7, "B11":10, "B12":11}
-    rgb = to_rgb_composite(x12, band_map["B4"], band_map["B3"], band_map["B2"])
+col1, col2 = st.columns(2)
 
-    c1, c2 = st.columns(2)
+with col1:
+    st.subheader("Fire Probability Map")
+    fig = plt.figure(figsize=(6,6))
+    plt.imshow(prob_map, cmap="magma")
+    plt.colorbar(fraction=0.046, pad=0.04)
+    plt.axis("off")
+    st.pyplot(fig)
 
-    with c1:
-        st.subheader("Fire Probability Map")
-        fig = plt.figure(figsize=(6,6))
-        plt.imshow(prob_map, cmap="magma")
-        plt.colorbar(fraction=0.046, pad=0.04)
-        plt.axis("off")
-        st.pyplot(fig)
+with col2:
+    st.subheader("Risk Overlay")
+    fig = plt.figure(figsize=(6,6))
+    plt.imshow(rgb)
+    plt.imshow(mask_high.astype(np.float32), cmap="Reds", alpha=0.45)
+    plt.axis("off")
+    plt.title(f"FRI={fri:.3f} | {risk_level}\nHigh-risk area={area_high*100:.2f}% | Conf={conf_high:.3f}")
+    st.pyplot(fig)
 
-    with c2:
-        st.subheader("Risk Overlay")
-        fig = plt.figure(figsize=(6,6))
-        plt.imshow(rgb)
-        plt.imshow(mask_high, cmap="Reds", alpha=0.45)
-        plt.axis("off")
-        plt.title(f"FRI={fri:.3f} | {level}\nHigh-risk={area_high*100:.2f}% | Conf={conf_high:.3f}")
-        st.pyplot(fig)
-
-    st.markdown("### Ringkasan")
-    st.write({
-        "npz_keys": keys,
-        "FRI": fri,
-        "risk_level": level,
-        "area_high(%)": area_high*100,
-        "conf_high": conf_high,
-        "t_pixel_high": t_pixel_high,
-        "t_low": t_low,
-        "t_high": t_high
-    })
-
-except Exception as e:
-    st.error(str(e))
-    st.stop()
+st.markdown("### Summary")
+st.write({
+    "FRI": fri,
+    "Risk Level": risk_level,
+    "High-risk Area (%)": area_high * 100.0,
+    "Confidence (mean p on high pixels)": conf_high,
+    "t_pixel_high": float(t_pixel_high),
+    "t_low": float(t_low),
+    "t_high": float(t_high),
+    "npz_keys_found": {"image_key": k_img, "aerosol_key": k_aer}
+})
