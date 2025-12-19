@@ -1,0 +1,6 @@
+streamlit
+numpy
+torch
+matplotlib
+joblib
+scikit-learn
